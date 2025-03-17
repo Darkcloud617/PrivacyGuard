@@ -1,0 +1,1142 @@
+import sys
+import os
+import re
+import nltk
+import torch
+import requests
+import hashlib
+import json
+import difflib
+import logging
+import openai
+from dotenv import load_dotenv, set_key, find_dotenv
+from PyQt5 import QtWidgets, QtGui, QtCore
+from PyQt5.QtCore import QThread, pyqtSignal
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from sentence_transformers import SentenceTransformer, util
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
+import io
+from PIL import Image
+import PyPDF2
+from bs4 import BeautifulSoup
+import docx
+from fpdf import FPDF
+from selenium import webdriver
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+from selenium.common.exceptions import TimeoutException
+from nltk.tokenize import sent_tokenize
+import tiktoken
+
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+dotenv_path = os.path.join(script_dir, '.env')
+
+if not os.path.exists(dotenv_path):
+    with open(dotenv_path, 'w') as f:
+        f.write("OPENAI_API_KEY=\n")
+
+load_dotenv(dotenv_path)
+
+# Set OpenAI API key
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Download NLTK's punkt tokenizer if not already present
+nltk.download('punkt')
+
+logging.basicConfig(filename='analyzer.log', level=logging.INFO,
+                    format='%(asctime)s:%(levelname)s:%(message)s')
+
+# Global variables for regulation updates
+GDPR_UPDATED = False
+CCPA_UPDATED = False
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setFixedSize(400, 150)
+        self.initUI()
+
+    def initUI(self):
+        layout = QtWidgets.QVBoxLayout()
+
+        instruction_label = QtWidgets.QLabel("Enter your OpenAI API Key:")
+        layout.addWidget(instruction_label)
+
+        self.api_key_input = QtWidgets.QLineEdit()
+        self.api_key_input.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.api_key_input.setPlaceholderText("sk-...")
+        layout.addWidget(self.api_key_input)
+
+        save_button = QtWidgets.QPushButton("Save")
+        save_button.clicked.connect(self.save_api_key)
+        layout.addWidget(save_button)
+
+        self.setLayout(layout)
+
+        existing_key = os.getenv("OPENAI_API_KEY")
+        if existing_key:
+            self.api_key_input.setText(existing_key)
+
+    def save_api_key(self):
+        api_key = self.api_key_input.text().strip()
+        if not api_key:
+            QtWidgets.QMessageBox.warning(self, "Input Error", "API key cannot be empty.")
+            return
+
+        try:
+            set_key(dotenv_path, "OPENAI_API_KEY", api_key)
+            load_dotenv(dotenv_path)
+            openai.api_key = api_key
+            QtWidgets.QMessageBox.information(self, "Success", "API key saved successfully.")
+            logging.info("OpenAI API key updated successfully.")
+            self.accept()
+        except Exception as e:
+            logging.error(f"Error saving API key: {e}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"An error occurred while saving the API key: {e}")
+
+class ProgressDialog(QtWidgets.QDialog):
+    def __init__(self, total_chunks, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Analyzing Privacy Policy")
+        self.setFixedSize(400, 100)
+        layout = QtWidgets.QVBoxLayout()
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setMaximum(total_chunks)
+        layout.addWidget(self.progress_bar)
+        self.status_label = QtWidgets.QLabel("Starting analysis...")
+        layout.addWidget(self.status_label)
+        self.setLayout(layout)
+
+    def update_progress(self, current, status):
+        self.progress_bar.setValue(current)
+        self.status_label.setText(status)
+
+class AnalysisThread(QThread):
+    analysis_complete = pyqtSignal(dict)
+    analysis_failed = pyqtSignal(str)
+    progress_update = pyqtSignal(int, str)
+
+    def __init__(self, policy_text, parent=None):
+        super().__init__(parent)
+        self.policy_text = policy_text
+        self.parent_widget = parent
+
+    def run(self):
+        try:
+            logging.info('Starting analysis of the privacy policy.')
+
+            chunks = self.parent_widget.split_text_into_chunks(self.policy_text, max_tokens=1000)
+            total_chunks = len(chunks)
+            logging.info(f'Policy text split into {total_chunks} chunks.')
+
+            aggregated_summary = ""
+            aggregated_concerns = {}
+            aggregated_category_scores = {
+                'Data Collection': 0,
+                'Data Sharing': 0,
+                'User Rights': 0,
+                'Data Security': 0,
+                'Policy Transparency': 0,
+                'Compliance': 0
+            }
+
+            for idx, chunk in enumerate(chunks):
+                current_chunk_number = idx + 1
+                status_message = f'Analyzing chunk {current_chunk_number} of {total_chunks}...'
+                self.progress_update.emit(current_chunk_number, status_message)
+                logging.info(f'Analyzing chunk {current_chunk_number}/{total_chunks}.')
+
+                summary = self.parent_widget.summarize_text(chunk)
+                aggregated_summary += f"\n\n--- Chunk {current_chunk_number} Summary ---\n{summary}"
+
+                # Detection
+                concerns_text, score, category_scores = self.parent_widget.detect_privacy_concerns(chunk)
+                # Aggregate concerns
+                concerns_list = concerns_text.split('\n\n')
+                for concern in concerns_list:
+                    if concern:
+                        parts = concern.split(' - ')
+                        if len(parts) >= 3:
+                            concern_desc = parts[0].strip()
+                            explanation = parts[1].strip()
+                            category = parts[2].strip().replace('Category: ', '')
+                            key = f"{concern_desc} ({category})"
+                            aggregated_concerns[key] = explanation
+                            if category in aggregated_category_scores:
+                                aggregated_category_scores[category] += 1
+
+            # Calculate privacy score
+            total_concerns = sum(aggregated_category_scores.values())
+            overall_score = max(0, 100 - (total_concerns * 5))
+
+            concerns_text = ""
+            for key, explanation in aggregated_concerns.items():
+                concerns_text += f"{key} - {explanation}\n\n"
+
+            # Graph Recommendations
+            graph_recommendations = self.parent_widget.get_graph_recommendations(aggregated_category_scores)
+            graph_annotations = self.parent_widget.get_graph_annotations(aggregated_category_scores)
+
+            # Generate a hash of the policy text uniquely
+            policy_hash = hashlib.sha256(self.policy_text.encode('utf-8')).hexdigest()
+            logging.info(f'Generated policy hash: {policy_hash}')
+
+            analysis_results = {
+                'summary': aggregated_summary.strip(),
+                'concerns': concerns_text.strip(),
+                'score': overall_score,
+                'category_scores': aggregated_category_scores,
+                'policy_hash': policy_hash,
+                'policy_text': self.policy_text,  # For comparison
+                'graph_recommendations': graph_recommendations,
+                'graph_annotations': graph_annotations
+            }
+
+            self.analysis_complete.emit(analysis_results)
+            logging.info('Analysis completed and results emitted.')
+        except Exception as e:
+            logging.error(f'Error during analysis: {e}')
+            self.analysis_failed.emit(str(e))
+
+class PrivacyPolicyAnalyzer(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.title = 'DataGuardX Privacy Policy Analyzer'
+        self.left = 100
+        self.top = 100
+        self.width = 1400
+        self.height = 1000
+        self.saved_policies = {}
+        self.similarity_threshold = 0.7
+        self.initUI()
+        self.load_models()
+        self.check_regulation_updates()
+
+    def initUI(self):
+        self.setWindowTitle(self.title)
+        self.setGeometry(self.left, self.top, self.width, self.height)
+
+        menubar = self.menuBar()
+        settings_menu = menubar.addMenu('Settings')
+
+        set_api_key_action = QtWidgets.QAction('Set OpenAI API Key', self)
+        set_api_key_action.triggered.connect(self.open_settings_dialog)
+        settings_menu.addAction(set_api_key_action)
+
+        export_menu = menubar.addMenu('Export')
+        export_summary_action = QtWidgets.QAction('Export Summary', self)
+        export_summary_action.triggered.connect(lambda: self.export_results('summary'))
+        export_menu.addAction(export_summary_action)
+
+        export_concerns_action = QtWidgets.QAction('Export Privacy Concerns', self)
+        export_concerns_action.triggered.connect(lambda: self.export_results('concerns'))
+        export_menu.addAction(export_concerns_action)
+
+        export_score_action = QtWidgets.QAction('Export Privacy Score', self)
+        export_score_action.triggered.connect(lambda: self.export_results('score'))
+        export_menu.addAction(export_score_action)
+
+        export_comparison_action = QtWidgets.QAction('Export Policy Comparison', self)
+        export_comparison_action.triggered.connect(lambda: self.export_results('comparison'))
+        export_menu.addAction(export_comparison_action)
+
+        self.central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(self.central_widget)
+
+        # Main Layout
+        main_layout = QtWidgets.QVBoxLayout(self.central_widget)
+
+        # Input Section with Tabs
+        self.input_tabs = QtWidgets.QTabWidget()
+        self.text_input_tab = QtWidgets.QWidget()
+        self.url_input_tab = QtWidgets.QWidget()
+        self.file_input_tab = QtWidgets.QWidget()
+
+        self.input_tabs.addTab(self.text_input_tab, "Text Input")
+        self.input_tabs.addTab(self.url_input_tab, "URL Input")
+        self.input_tabs.addTab(self.file_input_tab, "File Upload")
+
+        # Text Input
+        text_layout = QtWidgets.QVBoxLayout(self.text_input_tab)
+        self.input_text = QtWidgets.QTextEdit()
+        self.input_text.setPlaceholderText('Paste Privacy Policy Here...')
+        text_layout.addWidget(self.input_text)
+        self.analyze_button_text = QtWidgets.QPushButton('Analyze')
+        self.analyze_button_text.setFixedHeight(40)
+        self.analyze_button_text.clicked.connect(self.analyze_policy_text)
+        text_layout.addWidget(self.analyze_button_text)
+
+        # URL Input
+        url_layout = QtWidgets.QVBoxLayout(self.url_input_tab)
+        self.url_input = QtWidgets.QLineEdit()
+        self.url_input.setPlaceholderText('Enter URL Here...')
+        url_layout.addWidget(self.url_input)
+        self.analyze_button_url = QtWidgets.QPushButton('Fetch and Analyze')
+        self.analyze_button_url.setFixedHeight(40)
+        self.analyze_button_url.clicked.connect(self.analyze_policy_url)
+        url_layout.addWidget(self.analyze_button_url)
+
+        # File Upload
+        file_layout = QtWidgets.QVBoxLayout(self.file_input_tab)
+        file_input_layout = QtWidgets.QHBoxLayout()
+        self.file_path_input = QtWidgets.QLineEdit()
+        self.file_path_input.setPlaceholderText('No file selected...')
+        self.file_path_input.setReadOnly(True)
+        file_input_layout.addWidget(self.file_path_input)
+        self.browse_button = QtWidgets.QPushButton('Browse')
+        self.browse_button.clicked.connect(self.browse_file)
+        file_input_layout.addWidget(self.browse_button)
+        file_layout.addLayout(file_input_layout)
+        self.analyze_button_file = QtWidgets.QPushButton('Analyze')
+        self.analyze_button_file.setFixedHeight(40)
+        self.analyze_button_file.clicked.connect(self.analyze_policy_file)
+        file_layout.addWidget(self.analyze_button_file)
+
+        # Similarity Slider
+        threshold_layout = QtWidgets.QHBoxLayout()
+        self.threshold_label = QtWidgets.QLabel(f"{self.similarity_threshold:.2f}")
+        self.threshold_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.threshold_slider.setMinimum(50)  # Represents 0.5
+        self.threshold_slider.setMaximum(100)  # Represents 1.0
+        self.threshold_slider.setValue(int(self.similarity_threshold * 100))  # Default 0.7
+        self.threshold_slider.setTickInterval(5)
+        self.threshold_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.threshold_slider.valueChanged.connect(lambda value: self.update_threshold(value, self.threshold_label))
+        threshold_layout.addWidget(QtWidgets.QLabel("Similarity Threshold:"))
+        threshold_layout.addWidget(self.threshold_slider)
+        threshold_layout.addWidget(self.threshold_label)
+        main_layout.addLayout(threshold_layout)
+
+        # Output Tabs
+        self.output_tabs = QtWidgets.QTabWidget()
+        self.summary_tab = QtWidgets.QWidget()
+        self.concerns_tab = QtWidgets.QWidget()
+        self.score_tab = QtWidgets.QWidget()
+        self.comparison_tab = QtWidgets.QWidget()
+
+        self.output_tabs.addTab(self.summary_tab, "Summary")
+        self.output_tabs.addTab(self.concerns_tab, "Privacy Concerns")
+        self.output_tabs.addTab(self.score_tab, "Privacy Score")
+        self.output_tabs.addTab(self.comparison_tab, "Policy Comparison")
+
+        # Summary Tab
+        self.summary_text = QtWidgets.QTextEdit()
+        self.summary_text.setReadOnly(True)
+        summary_layout = QtWidgets.QVBoxLayout(self.summary_tab)
+        summary_layout.addWidget(self.summary_text)
+
+        # Concerns Tab
+        self.concerns_text = QtWidgets.QTextEdit()
+        self.concerns_text.setReadOnly(True)
+        concerns_layout = QtWidgets.QVBoxLayout(self.concerns_tab)
+        concerns_layout.addWidget(self.concerns_text)
+
+        # Score Tab
+        self.score_label = QtWidgets.QLabel()
+        self.score_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.score_label.setFont(QtGui.QFont('Arial', 16, QtGui.QFont.Bold))
+        self.score_progress = QtWidgets.QProgressBar()
+        self.score_progress.setFixedHeight(30)
+        self.score_progress.setTextVisible(False)
+        self.score_chart_label = QtWidgets.QLabel()
+        score_layout = QtWidgets.QVBoxLayout(self.score_tab)
+        score_layout.addWidget(self.score_label)
+        score_layout.addWidget(self.score_progress)
+        score_layout.addWidget(self.score_chart_label)
+
+        # Comparison Tab
+        self.comparison_text = QtWidgets.QTextEdit()
+        self.comparison_text.setReadOnly(True)
+        comparison_layout = QtWidgets.QVBoxLayout(self.comparison_tab)
+        comparison_layout.addWidget(self.comparison_text)
+
+        # Main Layout
+        main_layout.addWidget(self.input_tabs)
+        main_layout.addWidget(self.output_tabs)
+
+        # Set Style
+        self.setStyleSheet("""
+            QWidget {
+                font-size: 14px;
+                font-family: 'Segoe UI', sans-serif;
+            }
+            QTextEdit {
+                border: 1px solid #ccc;
+                padding: 8px;
+                background-color: #f9f9f9;
+            }
+            QLineEdit {
+                border: 1px solid #ccc;
+                padding: 8px;
+                background-color: #f9f9f9;
+            }
+            QPushButton {
+                background-color: #0078d7;
+                color: white;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #005a9e;
+            }
+            QTabWidget::pane {
+                border-top: 2px solid #C2C7CB;
+            }
+            QTabBar::tab {
+                background: #E0E0E0;
+                padding: 10px;
+            }
+            QTabBar::tab:selected {
+                background: #FFFFFF;
+                font-weight: bold;
+            }
+        """)
+
+    def load_models(self):
+        try:
+            if not openai.api_key:
+                QtWidgets.QMessageBox.warning(self, 'API Key Missing', 'Please set your OpenAI API key in Settings before performing analysis.')
+                logging.warning('OpenAI API key not set.')
+            else:
+                logging.info('Loading sentence transformer model...')
+                self.sentence_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+                logging.info('Sentence transformer model loaded successfully.')
+
+                # Privacy  Templates
+                self.concern_templates = [
+                    "We collect personal information.",
+                    "We collect biometric information.",
+                    "We track your online behavior.",
+                    "We share your data with third parties.",
+                    "We may transfer your data internationally.",
+                    "We may sell your personal data.",
+                    "We use cookies to track your activity.",
+                    "We may disclose your information for legal reasons.",
+                    "You have the right to opt-out.",
+                    "You have the right to access your data.",
+                    "You have the right to delete your data.",
+                    "We do not guarantee the security of your data.",
+                    "We use encryption to protect your data.",
+                    "We may change this policy at any time without notice.",
+                    "Your data may be used for analytics.",
+                    "We may use your information for advertising.",
+                    "We use your data for profiling.",
+                    "We use third-party service providers.",
+                    "We may not notify you of policy changes.",
+                    "We retain your information for as long as necessary.",
+                    # More Templates Here
+                ]
+
+                logging.info('Computing embeddings for concern templates...')
+                self.template_embeddings = self.sentence_model.encode(self.concern_templates, convert_to_tensor=True)
+                logging.info('Embeddings computed successfully.')
+
+                # Map templates to categories
+                self.template_categories = {
+                    0: 'Data Collection',       # "We collect personal information."
+                    1: 'Data Collection',       # "We collect biometric information."
+                    2: 'Data Collection',       # "We track your online behavior."
+                    3: 'Data Sharing',          # "We share your data with third parties."
+                    4: 'Data Sharing',          # "We may transfer your data internationally."
+                    5: 'Data Sharing',          # "We may sell your personal data."
+                    6: 'Data Collection',       # "We use cookies to track your activity."
+                    7: 'Compliance',            # "We may disclose your information for legal reasons."
+                    8: 'User Rights',           # "You have the right to opt-out."
+                    9: 'User Rights',           # "You have the right to access your data."
+                    10: 'User Rights',          # "You have the right to delete your data."
+                    11: 'Data Security',        # "We do not guarantee the security of your data."
+                    12: 'Data Security',        # "We use encryption to protect your data."
+                    13: 'Policy Transparency',  # "We may change this policy at any time without notice."
+                    14: 'Policy Transparency',  # "Your data may be used for analytics."
+                    15: 'Policy Transparency',  # "We may use your information for advertising."
+                    16: 'Data Sharing',         # "We use your data for profiling."
+                    17: 'Data Sharing',         # "We use third-party service providers."
+                    18: 'Policy Transparency',  # "We may not notify you of policy changes."
+                    19: 'Data Collection',      # "We retain your information for as long as necessary."
+                    # Add mappings
+                }
+
+        except Exception as e:
+            logging.error(f'Error loading models: {e}')
+            self.show_error_message('Model Loading Error', f'An error occurred while loading models: {e}')
+
+    def detect_privacy_concerns(self, text):
+        try:
+            if not openai.api_key:
+                self.show_error_message('API Key Missing', 'Please set your OpenAI API key in Settings before performing analysis.')
+                return "", 100, {}
+
+            logging.info('Starting privacy concern detection using OpenAI.')
+
+            # Define the enhanced prompt
+            prompt = (
+                "Analyze the following privacy policy and identify any potential privacy concerns. For each concern, provide a brief explanation of why it is a concern, its potential impact on users, and categorize it into one of the following categories: Data Collection, Data Sharing, User Rights, Data Security, Policy Transparency, Compliance.\n\n"
+                f"Privacy Policy Text:\n{text}\n\n"
+                "List of Privacy Concerns (format: 1. Category: Concern - Explanation):"
+            )
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a thorough analyst specializing in identifying and categorizing privacy concerns in policies."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=700,
+                temperature=0.7,
+                top_p=1,
+                frequency_penalty=0.2,
+                presence_penalty=0
+            )
+
+            concerns_output = response.choices[0].message['content'].strip()
+
+            concerns = []
+            category_scores = {
+                'Data Collection': 0,
+                'Data Sharing': 0,
+                'User Rights': 0,
+                'Data Security': 0,
+                'Policy Transparency': 0,
+                'Compliance': 0
+            }
+
+            lines = concerns_output.split('\n')
+            for line in lines:
+                match = re.match(r'\d+\.\s*(\w+):\s*([^-\n]+?)\s*-\s*(.+)', line)
+                if match:
+                    category, concern, explanation = match.groups()
+                    if category in category_scores:
+                        concerns.append(f"{concern} - {explanation} (Category: {category})")
+                        category_scores[category] += 1
+
+            total_concerns = sum(category_scores.values())
+
+            score = max(0, 100 - (total_concerns * 5))
+
+            concerns_text = '\n\n'.join(concerns)
+            logging.info(f'Detected {total_concerns} privacy concerns.')
+
+            return concerns_text, score, category_scores
+        except Exception as e:
+            logging.error(f'Error detecting privacy concerns with OpenAI: {e}')
+            raise e
+
+    def summarize_text(self, text):
+        try:
+            if not openai.api_key:
+                self.show_error_message('API Key Missing', 'Please set your OpenAI API key in Settings before performing analysis.')
+                return ""
+
+            logging.info('Starting text summarization using OpenAI.')
+
+            prompt = (
+                "Provide a detailed summary of the following privacy policy, highlighting key data collection practices, data sharing mechanisms, user rights, data security measures, and any potential areas of concern. Ensure that the summary captures the unique aspects of this policy and any significant compliance statements.\n\n"
+                f"Privacy Policy Text:\n{text}\n\n"
+                "Detailed Summary:"
+            )
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a knowledgeable assistant specializing in summarizing privacy policies."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.7,
+                top_p=1,
+                frequency_penalty=0.2,
+                presence_penalty=0
+            )
+
+            summary = response.choices[0].message['content'].strip()
+            logging.info('Text summarization completed successfully.')
+
+            enhanced_summary = self.enhance_summary(summary)
+            return enhanced_summary
+        except Exception as e:
+            logging.error(f'Error summarizing text with OpenAI: {e}')
+            raise e
+
+    def enhance_summary(self, summary):
+        try:
+            prompt = (
+                "Refine the following summary of a privacy policy to make it more detailed and easier to understand for end-users. Highlight any critical points and ensure that complex legal terms are explained in simple language.\n\n"
+                f"Original Summary:\n{summary}\n\n"
+                "Refined and Enhanced Summary:"
+            )
+
+            # OpenAI API
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a skilled editor enhancing text for clarity and detail."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.6,
+                top_p=1,
+                frequency_penalty=0.2,
+                presence_penalty=0
+            )
+
+            enhanced_summary = response.choices[0].message['content'].strip()
+            logging.info('Summary enhancement completed successfully.')
+            return enhanced_summary
+        except Exception as e:
+            logging.error(f'Error enhancing summary with OpenAI: {e}')
+            return summary
+
+    def get_graph_recommendations(self, category_scores):
+        try:
+            logging.info('Requesting graph recommendations from OpenAI.')
+
+            # Prepare data for recommendations
+            data_description = "The following categories represent different aspects of privacy concerns detected in a privacy policy:\n"
+            for category, count in category_scores.items():
+                data_description += f"- {category}: {count} concerns\n"
+
+            prompt = (
+                "Based on the following privacy concern categories and their counts, recommend the most effective types of graphs to visualize this data. "
+                "Explain why each recommended graph is suitable.\n\n"
+                f"{data_description}\n\nGraph Recommendations:"
+            )
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a data visualization expert."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=300,
+                temperature=0.5,
+                top_p=1,
+                frequency_penalty=0.2,
+                presence_penalty=0
+            )
+
+            recommendations = response.choices[0].message['content'].strip()
+            logging.info('Graph recommendations received from OpenAI.')
+            return recommendations
+        except Exception as e:
+            logging.error(f'Error getting graph recommendations from OpenAI: {e}')
+            return "Unable to retrieve graph recommendations at this time."
+
+    def get_graph_annotations(self, category_scores):
+        try:
+            logging.info('Requesting graph annotations from OpenAI.')
+
+            data_summary = "The following categories represent different aspects of privacy concerns detected in a privacy policy:\n"
+            for category, count in category_scores.items():
+                data_summary += f"- {category}: {count} concerns\n"
+
+            prompt = (
+                "Provide insightful annotations and explanations for a graph visualizing the following privacy concern categories and their counts. "
+                "The annotations should help users understand the significance of each category.\n\n"
+                f"{data_summary}\n\nGraph Annotations:"
+            )
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert in data visualization annotations."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=300,
+                temperature=0.5,
+                top_p=1,
+                frequency_penalty=0.2,
+                presence_penalty=0
+            )
+
+            annotations = response.choices[0].message['content'].strip()
+            logging.info('Graph annotations received from OpenAI.')
+            return annotations
+        except Exception as e:
+            logging.error(f'Error getting graph annotations from OpenAI: {e}')
+            return "Unable to retrieve graph annotations at this time."
+
+    def check_regulation_updates(self):
+        reply = QtWidgets.QMessageBox.question(
+            self, 'Regulation Update', 'Check for updates to GDPR and CCPA regulations?',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.Yes
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.update_regulations()
+
+    def update_regulations(self):
+        try:
+            global GDPR_UPDATED, CCPA_UPDATED
+            GDPR_UPDATED = True
+            CCPA_UPDATED = True
+
+            logging.info('Regulations updated successfully.')
+            QtWidgets.QMessageBox.information(self, 'Update Complete', 'Regulations have been updated.')
+        except Exception as e:
+            logging.error(f'Error updating regulations: {e}')
+            self.show_error_message('Update Error', f'An error occurred while updating regulations: {e}')
+
+    def analyze_policy_text(self):
+        policy_text = self.input_text.toPlainText()
+        if not policy_text.strip():
+            QtWidgets.QMessageBox.warning(self, 'Input Error', 'Please paste a privacy policy to analyze.')
+            return
+        self.start_analysis(policy_text)
+
+    def analyze_policy_url(self):
+        url = self.url_input.text()
+        if not url.strip():
+            QtWidgets.QMessageBox.warning(self, 'Input Error', 'Please enter a URL to analyze.')
+            return
+        policy_text = self.fetch_policy_from_url(url)
+        if policy_text:
+            self.start_analysis(policy_text)
+
+    def analyze_policy_file(self):
+        file_path = self.file_path_input.text()
+        if not file_path.strip():
+            QtWidgets.QMessageBox.warning(self, 'Input Error', 'Please select a file to analyze.')
+            return
+        policy_text = self.fetch_policy_from_file(file_path)
+        if policy_text:
+            self.start_analysis(policy_text)
+
+    def browse_file(self):
+        options = QtWidgets.QFileDialog.Options()
+        file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Privacy Policy File", "", "Text Files (*.txt);;PDF Files (*.pdf);;Word Documents (*.docx);;All Files (*)", options=options)
+        if file_name:
+            self.file_path_input.setText(file_name)
+
+    def fetch_policy_from_url(self, url):
+        try:
+            edge_options = EdgeOptions()
+            edge_options.add_argument("--headless")
+            edge_options.add_argument("--disable-gpu")
+            edge_options.add_argument("--no-sandbox")
+            edge_options.add_argument("--disable-dev-shm-usage")  # limited resource problem TEST
+
+            if sys.platform.startswith('win'):
+                driver_executable = 'msedgedriver.exe'
+            elif sys.platform.startswith('darwin') or sys.platform.startswith('linux'):
+                driver_executable = 'msedgedriver'
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Unsupported OS', 'Your operating system is not supported.')
+                logging.error('Unsupported operating system.')
+                return None
+            
+            driver_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), driver_executable)
+            
+            # Check if EdgeDriver exists
+            if not os.path.exists(driver_path):
+                QtWidgets.QMessageBox.warning(self, 'Driver Missing', f'EdgeDriver not found at {driver_path}. Please ensure it is placed in the application directory.')
+                logging.error(f'EdgeDriver not found at {driver_path}.')
+                return None
+            
+            driver = webdriver.Edge(executable_path=driver_path, options=edge_options)
+            
+            driver.get(url)
+            
+            try:
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='policy'], section[class*='policy']"))
+                )
+            except TimeoutException:
+                logging.warning('Timed out waiting for policy content to load.')
+            
+            html_content = driver.page_source
+            
+            driver.quit()
+            
+            # Extract policy from HTML
+            policy_text = self.extract_policy_text(html_content, is_url=True)
+            
+            if policy_text:
+                logging.info('Policy scraped and parsed successfully from URL using EdgeDriver.')
+                return policy_text
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Extraction Error', 'Unable to extract privacy policy from the URL.')
+                logging.warning('Failed to extract policy from URL using EdgeDriver.')
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, 'Request Error', f'An error occurred while fetching the URL: {e}')
+            logging.error(f'Error fetching policy from URL using EdgeDriver: {e}')
+        return None
+
+    def fetch_policy_from_file(self, file_path):
+        try:
+            if file_path.lower().endswith('.pdf'):
+                with open(file_path, 'rb') as file:
+                    reader = PyPDF2.PdfReader(file)
+                    policy_text = ''
+                    for page in reader.pages:
+                        text = page.extract_text()
+                        if text:
+                            policy_text += text + '\n'
+            elif file_path.lower().endswith('.txt'):
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    policy_text = file.read()
+            elif file_path.lower().endswith('.docx'):
+                doc = docx.Document(file_path)
+                policy_text = '\n'.join([para.text for para in doc.paragraphs])
+            else:
+                QtWidgets.QMessageBox.warning(self, 'File Type Error', 'Unsupported file type. Please upload a .txt, .pdf, or .docx file.')
+                logging.warning('Unsupported file type uploaded.')
+                return None
+
+            if policy_text:
+                policy_text = self.extract_policy_text(policy_text, is_url=False)
+                if policy_text:
+                    logging.info('Policy parsed successfully from file.')
+                    return policy_text
+                else:
+                    QtWidgets.QMessageBox.warning(self, 'Extraction Error', 'Unable to parse privacy policy from the file.')
+                    logging.warning('Failed to parse policy from file.')
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Extraction Error', 'Unable to extract text from the selected file.')
+                logging.warning('Failed to extract policy from file.')
+        except PyPDF2.errors.PdfReadError:
+            QtWidgets.QMessageBox.warning(self, 'PDF Read Error', 'Failed to read the PDF file. It may be corrupted or encrypted.')
+            logging.error('Failed to read the PDF file.')
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, 'File Error', f'An error occurred while reading the file: {e}')
+            logging.error(f'Error fetching policy from file: {e}')
+        return None
+
+    def extract_policy_text(self, content, is_url=True):
+        try:
+            # If the content is from a URL, it might be HTML. Extract accordingly.
+            if is_url:
+                soup = BeautifulSoup(content, 'html.parser')
+                policy_sections = soup.find_all(['div', 'section'], attrs={
+                    'class': re.compile(r'(policy|privacy)', re.I),
+                    'id': re.compile(r'(policy|privacy)', re.I)
+                })
+                policy_text = ''
+                for section in policy_sections:
+                    policy_text += section.get_text(separator='\n', strip=True) + '\n'
+                if not policy_text:
+                    policy_text = soup.get_text(separator='\n', strip=True)
+            else:
+                policy_text = content
+
+            return policy_text
+        except Exception as e:
+            logging.error(f'Error extracting policy text: {e}')
+            return None
+
+    def start_analysis(self, policy_text):
+        try:
+            if not openai.api_key:
+                QtWidgets.QMessageBox.warning(self, 'API Key Missing', 'Please set your OpenAI API key in Settings before performing analysis.')
+                return
+
+            # Disable analyze buttons
+            self.analyze_button_text.setEnabled(False)
+            self.analyze_button_url.setEnabled(False)
+            self.analyze_button_file.setEnabled(False)
+
+            # determine total
+            chunks = self.split_text_into_chunks(policy_text, max_tokens=1000)
+            total_chunks = len(chunks)
+
+            # Initialize progress dialog
+            self.progress_dialog = ProgressDialog(total_chunks, self)
+            self.progress_dialog.show()
+
+            # Start analysis
+            self.analysis_thread = AnalysisThread(policy_text, parent=self)
+            self.analysis_thread.analysis_complete.connect(self.on_analysis_complete)
+            self.analysis_thread.analysis_failed.connect(self.on_analysis_failed)
+            self.analysis_thread.progress_update.connect(self.progress_dialog.update_progress)
+            self.analysis_thread.start()
+            logging.info('Analysis thread started.')
+        except Exception as e:
+            logging.error(f'Error starting analysis: {e}')
+            self.show_error_message('Analysis Error', f'An error occurred while starting analysis: {e}')
+
+    def on_analysis_complete(self, analysis_results):
+        try:
+            # Remove loading
+            if self.progress_dialog:
+                self.progress_dialog.close()
+                self.progress_dialog = None
+
+            # Enable analyze buttons
+            self.analyze_button_text.setEnabled(True)
+            self.analyze_button_url.setEnabled(True)
+            self.analyze_button_file.setEnabled(True)
+
+            # Display results
+            self.summary_text.setText(analysis_results['summary'])
+            self.concerns_text.setText(analysis_results['concerns'])
+            self.display_privacy_score(analysis_results['score'], analysis_results['category_scores'])
+
+            # Generate and display graphs
+            self.generate_graphs(analysis_results['category_scores'], analysis_results['graph_recommendations'], analysis_results['graph_annotations'])
+
+            # policy comparison
+            policy_hash = analysis_results['policy_hash']
+            if policy_hash in self.saved_policies:
+                previous_policy_text = self.saved_policies[policy_hash]
+                comparison = self.compare_policies(previous_policy_text, analysis_results['policy_text'])
+                self.comparison_text.setHtml(comparison)  # Use HTML to display highlighted diff
+                self.output_tabs.setTabEnabled(self.output_tabs.indexOf(self.comparison_tab), True)
+                logging.info('Policy comparison completed.')
+            else:
+                # Save policy
+                self.saved_policies[policy_hash] = analysis_results['policy_text']
+                self.comparison_text.setText('No previous version of this policy found.')
+                self.output_tabs.setTabEnabled(self.output_tabs.indexOf(self.comparison_tab), False)
+                logging.info('New policy saved; no comparison performed.')
+
+        except Exception as e:
+            logging.error(f'Error handling analysis completion: {e}')
+            self.show_error_message('Display Error', f'An error occurred while displaying results: {e}')
+
+    def on_analysis_failed(self, error_message):
+        # Remove loading indicator
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        self.analyze_button_text.setEnabled(True)
+        self.analyze_button_url.setEnabled(True)
+        self.analyze_button_file.setEnabled(True)
+
+        self.show_error_message('Analysis Error', f'An error occurred during analysis: {error_message}')
+
+    def compare_policies(self, old_text, new_text):
+        try:
+            logging.info('Starting policy comparison using OpenAI.')
+
+            prompt = (
+                "Compare the following two privacy policies and provide a detailed analysis of the changes. Focus on new data collection practices, changes in data sharing mechanisms, updates to user rights, enhancements or reductions in data security measures, and any shifts in policy transparency or compliance statements.\n\n"
+                "Previous Policy:\n"
+                f"{old_text}\n\n"
+                "Current Policy:\n"
+                f"{new_text}\n\n"
+                "Detailed Comparison:"
+            )
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert in analyzing and comparing privacy policies."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
+                temperature=0.7,
+                top_p=1,
+                frequency_penalty=0.2,
+                presence_penalty=0
+            )
+
+            comparison = response.choices[0].message['content'].strip()
+            logging.info('Policy comparison completed successfully.')
+            return comparison
+        except Exception as e:
+            logging.error(f'Error comparing policies with OpenAI: {e}')
+            return f'<p style="color: red;">An error occurred while comparing policies: {e}</p>'
+
+    def display_privacy_score(self, score, category_scores):
+        try:
+            # Update Label
+            self.score_label.setText(f'Privacy Score: {score}/100')
+
+            # Set color based on score
+            if score >= 90:
+                color = 'green'
+            elif score >= 70:
+                color = 'darkgreen'
+            elif score >= 50:
+                color = 'orange'
+            else:
+                color = 'red'
+
+            self.score_label.setStyleSheet(f'color: {color}; margin-top: 20px;')
+
+            # Progress Bar
+            self.score_progress.setValue(score)
+            self.score_progress.setStyleSheet(f"""
+                QProgressBar::chunk {{
+                    background-color: {color};
+                }}
+            """)
+
+            # Generate Bar Chart
+            categories = list(category_scores.keys())
+            scores = list(category_scores.values())
+
+            # Create a bar chart using Matplotlib
+            fig, ax = plt.subplots(figsize=(8, 6))
+            bars = ax.bar(categories, scores, color=plt.cm.tab20.colors[:len(categories)])
+
+            # Add count labels on top of each bar
+            for bar in bars:
+                height = bar.get_height()
+                ax.annotate('{}'.format(height),
+                            xy=(bar.get_x() + bar.get_width() / 2, height),
+                            xytext=(0, 3),  # 3 point offset
+                            textcoords="offset points",
+                            ha='center', va='bottom')
+
+            ax.set_xlabel('Privacy Concern Categories')
+            ax.set_ylabel('Number of Concerns')
+            ax.set_title('Distribution of Privacy Concerns by Category')
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+
+            # Buffer for image
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            plt.close(fig)
+            buf.seek(0)
+
+            img = Image.open(buf)
+            img = img.resize((800, 600), Image.LANCZOS)
+            img = img.convert("RGBA")
+            data = img.tobytes("raw", "RGBA")
+
+            qimg = QtGui.QImage(data, img.size[0], img.size[1], QtGui.QImage.Format_RGBA8888)
+            pixmap = QtGui.QPixmap.fromImage(qimg)
+            self.score_chart_label.setPixmap(pixmap)
+            self.score_chart_label.setAlignment(QtCore.Qt.AlignCenter)
+
+            logging.info('Privacy score displayed successfully with bar chart.')
+        except Exception as e:
+            logging.error(f'Error displaying privacy score: {e}')
+            self.show_error_message('Visualization Error', f'An error occurred while displaying the privacy score: {e}')
+
+    def generate_graphs(self, category_scores, recommendations, annotations):
+        try:
+            # Display graph recommendations
+            recommendations_text = f"<b>Graph Recommendations:</b>\n{recommendations}\n\n<b>Graph Annotations:</b>\n{annotations}"
+            self.score_chart_label.setToolTip(recommendations_text)
+
+            logging.info('Graph generation and annotations handled successfully.')
+        except Exception as e:
+            logging.error(f'Error generating graphs: {e}')
+            self.show_error_message('Graph Generation Error', f'An error occurred while generating graphs: {e}')
+
+    def show_error_message(self, title, message):
+        QtWidgets.QMessageBox.critical(self, title, message)
+
+    def update_threshold(self, value, label):
+        self.similarity_threshold = value / 100.0
+        label.setText(f"{self.similarity_threshold:.2f}")
+        logging.info(f'Similarity threshold updated to {self.similarity_threshold:.2f}')
+
+    def closeEvent(self, event):
+        # Ensure threads are properly closed when the application is closed
+        try:
+            if hasattr(self, 'analysis_thread') and self.analysis_thread.isRunning():
+                self.analysis_thread.terminate()
+                self.analysis_thread.wait()
+                logging.info('Analysis thread terminated upon closing.')
+        except Exception as e:
+            logging.error(f'Error during application close: {e}')
+        event.accept()
+
+    def open_settings_dialog(self):
+        dialog = SettingsDialog(self)
+        dialog.exec_()
+
+    def export_results(self, section):
+        try:
+            if section == 'summary':
+                content = self.summary_text.toPlainText()
+                title = "Privacy Policy Summary"
+            elif section == 'concerns':
+                content = self.concerns_text.toPlainText()
+                title = "Privacy Concerns"
+            elif section == 'score':
+                content = self.score_label.text() + "\n\n" + self.score_chart_label.toolTip()
+                title = "Privacy Score"
+            elif section == 'comparison':
+                content = self.comparison_text.toHtml()
+                title = "Policy Comparison"
+            else:
+                content = ""
+                title = "Export"
+
+            if not content.strip():
+                QtWidgets.QMessageBox.warning(self, 'Export Error', 'No content available to export.')
+                return
+
+            options = QtWidgets.QFileDialog.Options()
+            file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, f"Export {title}", "", "PDF Files (*.pdf);;Text Files (*.txt)", options=options)
+            if file_path:
+                if file_path.lower().endswith('.pdf'):
+                    self.export_to_pdf(file_path, title, content)
+                else:
+                    with open(file_path, 'w', encoding='utf-8') as file:
+                        clean_content = re.sub('<[^<]+?>', '', content)
+                        file.write(clean_content)
+                QtWidgets.QMessageBox.information(self, 'Export Success', f'{title} exported successfully.')
+                logging.info(f'{title} exported to {file_path}')
+        except Exception as e:
+            logging.error(f'Error exporting {section}: {e}')
+            self.show_error_message('Export Error', f'An error occurred while exporting {section}: {e}')
+
+    def export_to_pdf(self, file_path, title, content):
+        try:
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", 'B', 16)
+            pdf.cell(0, 10, title, ln=True, align='C')
+            pdf.set_font("Arial", size=12)
+            # Handle HTML
+            if '<html>' in content.lower():
+                clean_content = re.sub('<[^<]+?>', '', content)
+            else:
+                clean_content = content
+            for line in clean_content.split('\n'):
+                pdf.multi_cell(0, 10, line)
+            pdf.output(file_path)
+            logging.info(f'{title} exported as PDF to {file_path}')
+        except Exception as e:
+            logging.error(f'Error exporting to PDF: {e}')
+            self.show_error_message('PDF Export Error', f'An error occurred while exporting to PDF: {e}')
+
+    def split_text_into_chunks(self, text, max_tokens=1000):
+        # Splits the input text into chunks based on actual token counts using OpenAI's tokenizer.
+
+        encoding = tiktoken.get_encoding("cl100k_base")  # Model Encoding
+        sentences = sent_tokenize(text)
+        chunks = []
+        current_chunk = ""
+        current_tokens = 0
+
+        for sentence in sentences:
+            sentence_tokens = len(encoding.encode(sentence))
+            if current_tokens + sentence_tokens > max_tokens:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence
+                current_tokens = sentence_tokens
+            else:
+                current_chunk += " " + sentence
+                current_tokens += sentence_tokens
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        return chunks
+
+    def show_error_message(self, title, message):
+        QtWidgets.QMessageBox.critical(self, title, message)
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    analyzer = PrivacyPolicyAnalyzer()
+    analyzer.show()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
